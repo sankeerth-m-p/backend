@@ -80,6 +80,49 @@ def clear_month():
     db.session.commit()
     return jsonify({"ok": True}), 200
 
+@events_bp.route("/delete-bulk", methods=["POST"])
+@jwt_required()
+def bulk_delete_events():
+    user_id = get_jwt_identity()
+    data = request.get_json() or {}
+    items = data.get("items", [])
+
+    if not isinstance(items, list):
+        return jsonify({"error": "items must be a list"}), 400
+
+    deleted = 0
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+
+        date_iso = item.get("dateISO")
+        event_col_raw = item.get("eventCol")
+
+        if not date_iso or event_col_raw is None:
+            continue
+
+        try:
+            date_obj = datetime.strptime(date_iso, "%Y-%m-%d").date()
+            event_col = int(event_col_raw)
+        except (ValueError, TypeError):
+            continue
+
+        if event_col <= 0:
+            continue
+
+        event = Event.query.filter_by(
+            user_id=user_id,
+            date=date_obj,
+            event_col=event_col,
+        ).first()
+
+        if event:
+            db.session.delete(event)
+            deleted += 1
+
+    db.session.commit()
+    return jsonify({"ok": True, "deleted": deleted}), 200
 
 @events_bp.route("/bulk", methods=["POST"])
 @jwt_required()
