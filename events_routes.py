@@ -1,9 +1,14 @@
-from flask import Blueprint, request, jsonify
-from flask_jwt_extended import jwt_required, get_jwt_identity
+from datetime import datetime
+
+from flask import Blueprint, jsonify, request
+from flask_jwt_extended import get_jwt_identity, jwt_required
+
 from extensions import db
 from models import Event
-from datetime import datetime
+
+
 events_bp = Blueprint("events", __name__)
+
 
 @events_bp.route("/month", methods=["GET"])
 @jwt_required()
@@ -23,9 +28,9 @@ def get_month_events():
     ).all()
 
     result = {}
-    for r in rows:
-        date_iso = r.date.isoformat()
-        result.setdefault(date_iso, {})[f"Event {r.event_col}"] = r.value
+    for row in rows:
+        date_iso = row.date.isoformat()
+        result.setdefault(date_iso, {})[f"Event {row.event_col}"] = row.value
 
     return jsonify(result), 200
 
@@ -34,27 +39,52 @@ def get_month_events():
 @jwt_required()
 def update_cell():
     user_id = get_jwt_identity()
-    data = request.json
+    data = request.get_json() or {}
 
-    if not data:
-        return jsonify({"error": "Missing body"}), 400
+    date_iso = data.get("dateISO")
+    event_col = data.get("eventCol")
+    value = data.get("value")
+
+    if not date_iso or event_col is None or value is None:
+        return jsonify({"error": "dateISO, eventCol and value are required"}), 400
+
+    try:
+        event_col = int(event_col)
+    except (TypeError, ValueError):
+        return jsonify({"error": "eventCol must be a number"}), 400
+
+    try:
+        date_obj = datetime.strptime(date_iso, "%Y-%m-%d").date()
+    except ValueError:
+        return jsonify({"error": "Invalid dateISO format. Use YYYY-MM-DD"}), 400
 
     event = Event.query.filter_by(
         user_id=user_id,
-        date=data["dateISO"],
-        event_col=data["eventCol"],
+        date=date_obj,
+        event_col=event_col,
     ).first()
 
-    if event:
-        event.value = data["value"]
-    else:
-        event = Event(
-            user_id=user_id,
-            date=data["dateISO"],
-            event_col=data["eventCol"],
-            value=data["value"],
-        )
+    if not event:
+        event = Event(user_id=user_id, date=date_obj, event_col=event_col, value="")
         db.session.add(event)
+
+    event.value = value
+
+    event_datetime_raw = data.get("eventDateTime")
+    reminder_minutes_before = data.get("reminderMinutesBefore")
+    reminder_at_raw = data.get("reminderAt")
+    reminder_timezone = data.get("reminderTimezone")
+    notification_status = data.get("notificationStatus")
+
+    event.event_datetime = _parse_iso_datetime(event_datetime_raw)
+    event.reminder_at = _parse_iso_datetime(reminder_at_raw)
+    event.reminder_minutes_before = (
+        int(reminder_minutes_before)
+        if reminder_minutes_before not in (None, "")
+        else None
+    )
+    event.reminder_timezone = reminder_timezone or None
+    event.notification_status = notification_status or None
 
     db.session.commit()
     return jsonify({"ok": True}), 200
@@ -106,7 +136,6 @@ def bulk_upsert_events():
         except ValueError:
             continue
 
-        # extra safety: only apply to selected month
         if date_obj.year != year or date_obj.month != month:
             continue
 
@@ -125,12 +154,25 @@ def bulk_upsert_events():
             if existing:
                 existing.value = value
             else:
-                db.session.add(Event(
-                    user_id=user_id,
-                    date=date_obj,
-                    event_col=event_col,
-                    value=value
-                ))
+                db.session.add(
+                    Event(
+                        user_id=user_id,
+                        date=date_obj,
+                        event_col=event_col,
+                        value=value,
+                    )
+                )
 
     db.session.commit()
     return jsonify({"ok": True})
+
+
+def _parse_iso_datetime(raw):
+    if raw in (None, ""):
+        return None
+
+    if isinstance(raw, str):
+        normalized = raw.replace("Z", "+00:00")
+        return datetime.fromisoformat(normalized)
+
+    return None

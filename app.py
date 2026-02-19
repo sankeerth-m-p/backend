@@ -8,6 +8,8 @@ from flask import Flask
 from flask_cors import CORS
 from config import Config
 from extensions import db, jwt
+from db_migrations import migrate_events_table
+
 
 def create_app():
     app = Flask(__name__)
@@ -17,11 +19,16 @@ def create_app():
     db.init_app(app)
     jwt.init_app(app)
 
-    # ✅ TEMP: init-db route (remove after first use)
+    with app.app_context():
+        db.create_all()
+        migrate_events_table()
+
+    # temp: init-db route (remove after first use)
     @app.route("/init-db")
     def init_db():
         with app.app_context():
             db.create_all()
+            migrate_events_table()
         return "DB initialized"
 
     from auth_routes import auth_bp
@@ -31,6 +38,7 @@ def create_app():
     app.register_blueprint(events_bp, url_prefix="/events")
 
     return app
+
 
 app = create_app()
 
