@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 
 from flask import Blueprint, jsonify, request
 from flask_jwt_extended import get_jwt_identity, jwt_required
@@ -84,7 +84,19 @@ def update_cell():
         else None
     )
     event.reminder_timezone = reminder_timezone or None
-    event.notification_status = notification_status or None
+    if str(value).strip() == "":
+        event.notification_status = None
+        event.notification_sent_at = None
+        event.event_datetime = None
+        event.reminder_at = None
+        event.reminder_minutes_before = None
+        event.reminder_timezone = None
+    else:
+        event.notification_status = notification_status or (
+            "pending" if event.reminder_at else None
+        )
+        if event.notification_status == "pending":
+            event.notification_sent_at = None
 
     db.session.commit()
     return jsonify({"ok": True}), 200
@@ -216,6 +228,9 @@ def _parse_iso_datetime(raw):
 
     if isinstance(raw, str):
         normalized = raw.replace("Z", "+00:00")
-        return datetime.fromisoformat(normalized)
+        dt = datetime.fromisoformat(normalized)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt
 
     return None
