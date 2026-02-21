@@ -122,6 +122,66 @@ def build_whatsapp_message(username, target_date, events):
 
     return "\n".join(lines).strip()
 
+
+def execute_whatsapp_for_date(target_date):
+    users = build_today_user_events_payload(target_date=target_date)
+    results = []
+
+    for user in users:
+        phone = (user.get("phone_number") or "").strip()
+        if not phone:
+            results.append(
+                {
+                    "user_id": user["user_id"],
+                    "username": user["username"],
+                    "phone_number": None,
+                    "sent": False,
+                    "error": "Missing phone_number",
+                }
+            )
+            continue
+
+        if not phone.startswith("whatsapp:"):
+            phone = f"whatsapp:{phone}"
+
+        message = build_whatsapp_message(
+            username=user["username"],
+            target_date=target_date,
+            events=user["events"],
+        )
+
+        try:
+            send_result = send_whatsapp(phone, message)
+            results.append(
+                {
+                    "user_id": user["user_id"],
+                    "username": user["username"],
+                    "phone_number": phone,
+                    "sent": True,
+                    "sid": send_result.get("sid"),
+                    "status": send_result.get("status"),
+                }
+            )
+        except Exception as exc:
+            results.append(
+                {
+                    "user_id": user["user_id"],
+                    "username": user["username"],
+                    "phone_number": phone,
+                    "sent": False,
+                    "error": str(exc),
+                }
+            )
+
+    sent_count = sum(1 for r in results if r["sent"])
+    return {
+        "date": target_date.isoformat(),
+        "total_users_with_events": len(users),
+        "sent_count": sent_count,
+        "failed_count": len(results) - sent_count,
+        "results": results,
+    }
+
 @events_bp.route("/month", methods=["GET"])
 @jwt_required()
 def get_month_events():
@@ -369,63 +429,5 @@ def trigger_whatsapp_today():
         except ValueError:
             return jsonify({"error": "date must be YYYY-MM-DD"}), 400
 
-    users = build_today_user_events_payload(target_date=target_date)
-    results = []
-
-    for user in users:
-        phone = (user.get("phone_number") or "").strip()
-        if not phone:
-            results.append(
-                {
-                    "user_id": user["user_id"],
-                    "username": user["username"],
-                    "phone_number": None,
-                    "sent": False,
-                    "error": "Missing phone_number",
-                }
-            )
-            continue
-
-        if not phone.startswith("whatsapp:"):
-            phone = f"whatsapp:{phone}"
-
-        message = build_whatsapp_message(
-            username=user["username"],
-            target_date=target_date,
-            events=user["events"],
-        )
-
-        try:
-            send_result = send_whatsapp(phone, message)
-            results.append(
-                {
-                    "user_id": user["user_id"],
-                    "username": user["username"],
-                    "phone_number": phone,
-                    "sent": True,
-                    "sid": send_result.get("sid"),
-                    "status": send_result.get("status"),
-                }
-            )
-        except Exception as exc:
-            results.append(
-                {
-                    "user_id": user["user_id"],
-                    "username": user["username"],
-                    "phone_number": phone,
-                    "sent": False,
-                    "error": str(exc),
-                }
-            )
-
-    sent_count = sum(1 for r in results if r["sent"])
-
-    return jsonify(
-        {
-            "date": target_date.isoformat(),
-            "total_users_with_events": len(users),
-            "sent_count": sent_count,
-            "failed_count": len(results) - sent_count,
-            "results": results,
-        }
-    ), 200
+    summary = execute_whatsapp_for_date(target_date=target_date)
+    return jsonify(summary), 200
