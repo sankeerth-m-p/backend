@@ -1,9 +1,126 @@
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from extensions import db
-from models import Event
-from datetime import datetime
+from models import Event, User
+from datetime import datetime, date
+from whatsapp_service import send_whatsapp
+import re
 events_bp = Blueprint("events", __name__)
+
+TAG_PREFIX_RE = re.compile(r"^\s*__TAG:([A-Za-z0-9_-]+)__\s*(.*)$")
+LEGACY_LABEL_RE = re.compile(r"^\s*__([A-Za-z0-9_-]+)__\s*(.*)$")
+BRACKET_LABEL_RE = re.compile(r"^\s*\[([A-Za-z0-9_-]+)\]\s*(.*)$")
+COLOR_RE = re.compile(r"^\s*\{(#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6}))\}\s*(.*)$")
+
+
+def parse_tagged_event_value(raw_value):
+    """
+    Parses frontend encoded event value into label/text/color.
+    Supported:
+    - __TAG:LABEL_ID__ {#RRGGBB} Event title
+    - __TAG:LABEL_ID__ Event title
+    - {#RRGGBB} Event title
+    - Event title
+    Legacy:
+    - __LABEL__ ...
+    - [LABEL] ...
+    """
+    s = (raw_value or "").strip()
+    label_id = None
+    text_color = None
+
+    m = TAG_PREFIX_RE.match(s) or LEGACY_LABEL_RE.match(s) or BRACKET_LABEL_RE.match(s)
+    if m:
+        label_id = m.group(1)
+        s = m.group(2).strip()
+
+    c = COLOR_RE.match(s)
+    if c:
+        text_color = c.group(1)
+        s = c.group(2).strip()
+
+    return {
+        "label_id": label_id,
+        "text_color": text_color,
+        "text": s,
+    }
+
+
+def build_today_user_events_payload(target_date=None):
+    """
+    Build a list of users with today's events.
+    Output shape:
+    [
+      {
+        "user_id": 1,
+        "username": "alice",
+        "phone_number": "whatsapp:+91...",
+        "events": [{"event_col": 1, "value": "Meeting"}]
+      }
+    ]
+    """
+    if target_date is None:
+        target_date = date.today()
+
+    rows = (
+        db.session.query(User, Event)
+        .join(Event, Event.user_id == User.id)
+        .filter(Event.date == target_date)
+        .order_by(User.id.asc(), Event.event_col.asc())
+        .all()
+    )
+
+    by_user = {}
+    for user, event in rows:
+        parsed_value = parse_tagged_event_value(event.value)
+
+        if user.id not in by_user:
+            by_user[user.id] = {
+                "user_id": user.id,
+                "username": user.username,
+                "phone_number": user.phone_number,
+                "events": [],
+            }
+
+        by_user[user.id]["events"].append(
+            {
+                "event_col": event.event_col,
+                "value": event.value,
+                "description": event.description,
+                "label": parsed_value.get("label_id"),
+                "text_color": parsed_value.get("text_color"),
+                "name": parsed_value.get("text"),
+                "date": event.date.isoformat(),
+            }
+        )
+
+    return list(by_user.values())
+
+
+def build_whatsapp_message(username, target_date, events):
+    total = len(events)
+    lines = [
+        "Upcoming Events",
+        f"Date: {target_date.isoformat()}",
+        f"User: {username}",
+        f"Total Events: {total}",
+        "",
+    ]
+
+    for idx, event in enumerate(events, start=1):
+        name = (event.get("name") or "").strip() or "Untitled Event"
+        description = (event.get("description") or "").strip() or "No description"
+        label = (event.get("label") or "").strip() or "General"
+        color = (event.get("text_color") or "").strip() or "None"
+
+        lines.append(f"Event {idx}")
+        lines.append(f"Name: {name}")
+        lines.append(f"Description: {description}")
+        lines.append(f"Label: {label}")
+        # lines.append(f"Color: {color}")
+        lines.append("")
+
+    return "\n".join(lines).strip()
 
 @events_bp.route("/month", methods=["GET"])
 @jwt_required()
@@ -25,7 +142,10 @@ def get_month_events():
     result = {}
     for r in rows:
         date_iso = r.date.isoformat()
-        result.setdefault(date_iso, {})[f"Event {r.event_col}"] = r.value
+        date_bucket = result.setdefault(date_iso, {})
+        event_key = f"Event {r.event_col}"
+        date_bucket[event_key] = r.value
+        date_bucket.setdefault("_descriptions", {})[event_key] = r.description
 
     return jsonify(result), 200
 
@@ -39,20 +159,30 @@ def update_cell():
     if not data:
         return jsonify({"error": "Missing body"}), 400
 
+    date_iso = data.get("dateISO")
+    event_col = data.get("eventCol")
+    value = data.get("value")
+
+    if date_iso is None or event_col is None or value is None:
+        return jsonify({"error": "dateISO, eventCol, value are required"}), 400
+
     event = Event.query.filter_by(
         user_id=user_id,
-        date=data["dateISO"],
-        event_col=data["eventCol"],
+        date=date_iso,
+        event_col=event_col,
     ).first()
 
     if event:
-        event.value = data["value"]
+        event.value = value
+        if "description" in data:
+            event.description = (data.get("description") or "").strip()
     else:
         event = Event(
             user_id=user_id,
-            date=data["dateISO"],
-            event_col=data["eventCol"],
-            value=data["value"],
+            date=date_iso,
+            event_col=event_col,
+            value=value,
+            description=(data.get("description") or "").strip(),
         )
         db.session.add(event)
 
@@ -153,11 +283,27 @@ def bulk_upsert_events():
         if date_obj.year != year or date_obj.month != month:
             continue
 
-        for key, value in events.items():
-            if not value or not key.startswith("Event "):
+        for key, raw_event in events.items():
+            if not key.startswith("Event "):
                 continue
 
-            event_col = int(key.replace("Event ", ""))
+            try:
+                event_col = int(key.replace("Event ", ""))
+            except ValueError:
+                continue
+
+            # Backward compatible:
+            # - old payload: "Event 1": "Title"
+            # - new payload: "Event 1": {"value": "Title", "description": "..."}
+            if isinstance(raw_event, dict):
+                value = (raw_event.get("value") or "").strip()
+                description = (raw_event.get("description") or "").strip()
+            else:
+                value = (str(raw_event) if raw_event is not None else "").strip()
+                description = ""
+
+            if not value:
+                continue
 
             existing = Event.query.filter_by(
                 user_id=user_id,
@@ -167,13 +313,119 @@ def bulk_upsert_events():
 
             if existing:
                 existing.value = value
+                existing.description = description
             else:
                 db.session.add(Event(
                     user_id=user_id,
                     date=date_obj,
                     event_col=event_col,
-                    value=value
+                    value=value,
+                    description=description,
                 ))
 
     db.session.commit()
     return jsonify({"ok": True})
+
+
+@events_bp.route("/today-user-events", methods=["GET"])
+def today_user_events():
+    """
+    Returns a list of users and their event list for today.
+    Optional query param:
+      - date=YYYY-MM-DD (for testing)
+    """
+    date_str = request.args.get("date", "").strip()
+    target_date = date.today()
+
+    if date_str:
+        try:
+            target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+        except ValueError:
+            return jsonify({"error": "date must be YYYY-MM-DD"}), 400
+
+    payload = build_today_user_events_payload(target_date=target_date)
+    return jsonify(
+        {
+            "date": target_date.isoformat(),
+            "count": len(payload),
+            "users": payload,
+        }
+    ), 200
+
+
+@events_bp.route("/trigger-whatsapp-today", methods=["POST"])
+def trigger_whatsapp_today():
+    """
+    Trigger WhatsApp messages for all users who have events today and a phone number.
+    Optional query param:
+      - date=YYYY-MM-DD (for testing)
+    """
+    date_str = request.args.get("date", "").strip()
+    target_date = date.today()
+
+    if date_str:
+        try:
+            target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+        except ValueError:
+            return jsonify({"error": "date must be YYYY-MM-DD"}), 400
+
+    users = build_today_user_events_payload(target_date=target_date)
+    results = []
+
+    for user in users:
+        phone = (user.get("phone_number") or "").strip()
+        if not phone:
+            results.append(
+                {
+                    "user_id": user["user_id"],
+                    "username": user["username"],
+                    "phone_number": None,
+                    "sent": False,
+                    "error": "Missing phone_number",
+                }
+            )
+            continue
+
+        if not phone.startswith("whatsapp:"):
+            phone = f"whatsapp:{phone}"
+
+        message = build_whatsapp_message(
+            username=user["username"],
+            target_date=target_date,
+            events=user["events"],
+        )
+
+        try:
+            send_result = send_whatsapp(phone, message)
+            results.append(
+                {
+                    "user_id": user["user_id"],
+                    "username": user["username"],
+                    "phone_number": phone,
+                    "sent": True,
+                    "sid": send_result.get("sid"),
+                    "status": send_result.get("status"),
+                }
+            )
+        except Exception as exc:
+            results.append(
+                {
+                    "user_id": user["user_id"],
+                    "username": user["username"],
+                    "phone_number": phone,
+                    "sent": False,
+                    "error": str(exc),
+                }
+            )
+
+    sent_count = sum(1 for r in results if r["sent"])
+
+    return jsonify(
+        {
+            "date": target_date.isoformat(),
+            "total_users_with_events": len(users),
+            "sent_count": sent_count,
+            "failed_count": len(results) - sent_count,
+            "results": results,
+        }
+    ), 200
