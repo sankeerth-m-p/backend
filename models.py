@@ -1,19 +1,48 @@
+# from extensions import db
+
+# class User(db.Model):
+#     id = db.Column(db.Integer, primary_key=True)
+#     username = db.Column(db.String(80), unique=True, nullable=False)
+#     password_hash = db.Column(db.String(256), nullable=False)
+#     phone_number = db.Column(db.String(20), unique=True, nullable=True)
+
+# class Event(db.Model):
+#     __tablename__ = "events"
+
+#     id = db.Column(db.Integer, primary_key=True)
+#     user_id = db.Column(db.Integer, nullable=False)
+#     date = db.Column(db.Date, nullable=False)
+#     event_col = db.Column(db.Integer, nullable=False)
+#     value = db.Column(db.Text, nullable=False)
+#     description = db.Column(db.Text, nullable=False, default="")
+
+#     __table_args__ = (
+#         db.UniqueConstraint("user_id", "date", "event_col"),
+#     )
+
+
 from extensions import db
 
 class User(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    username = db.Column(db.String(80), unique=True, nullable=False)
-    password_hash = db.Column(db.String(256), nullable=False)
-    phone_number = db.Column(db.String(20), unique=True, nullable=True)
+    id                = db.Column(db.Integer, primary_key=True)
+    username          = db.Column(db.String(80), unique=True, nullable=True)   # now optional
+    email             = db.Column(db.String(120), unique=True, nullable=True)
+    password_hash     = db.Column(db.String(256), nullable=True)               # optional for google users
+    phone_number      = db.Column(db.String(20), unique=True, nullable=True)
+    google_id         = db.Column(db.String(100), unique=True, nullable=True)
+    auth_provider     = db.Column(db.String(20), default="email")              # "email" | "google"
+    display_name      = db.Column(db.String(120), nullable=True)
+    avatar_url        = db.Column(db.String(500), nullable=True)
+    is_verified       = db.Column(db.Boolean, default=False)
 
 class Event(db.Model):
     __tablename__ = "events"
 
-    id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, nullable=False)
-    date = db.Column(db.Date, nullable=False)
-    event_col = db.Column(db.Integer, nullable=False)
-    value = db.Column(db.Text, nullable=False)
+    id          = db.Column(db.Integer, primary_key=True)
+    user_id     = db.Column(db.Integer, nullable=False)
+    date        = db.Column(db.Date, nullable=False)
+    event_col   = db.Column(db.Integer, nullable=False)
+    value       = db.Column(db.Text, nullable=False)
     description = db.Column(db.Text, nullable=False, default="")
 
     __table_args__ = (
