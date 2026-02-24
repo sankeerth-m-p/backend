@@ -8,7 +8,7 @@ from datetime import datetime, date
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from config import Config
-from extensions import db, jwt, migrate
+from extensions import db, jwt
 
 def create_app():
     app = Flask(__name__)
@@ -17,7 +17,7 @@ def create_app():
     CORS(app)
     db.init_app(app)
     jwt.init_app(app)
-    migrate.init_app(app, db)
+    # migrate.init_app(app, db)
 
     # Ensure models are loaded for Flask-Migrate autogenerate
     import models  # noqa: F401
