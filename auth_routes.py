@@ -4,7 +4,7 @@ from flask_jwt_extended import create_access_token
 from flask_jwt_extended import create_access_token, create_refresh_token
 from models import User
 from extensions import db
-rom flask_jwt_extended import jwt_required, get_jwt_identity
+from flask_jwt_extended import jwt_required, get_jwt_identity
 ADMIN_PASSWORD = "password123" 
 auth_bp = Blueprint("auth", __name__)
 @auth_bp.route("/login", methods=["POST"])
