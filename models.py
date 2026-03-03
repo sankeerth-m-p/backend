@@ -34,6 +34,7 @@ class User(db.Model):
     display_name      = db.Column(db.String(120), nullable=True)
     avatar_url        = db.Column(db.String(500), nullable=True)
     is_verified       = db.Column(db.Boolean, default=False)
+    role              = db.Column(db.String(20), default="user")   # "user" | "admin"
 
 class Event(db.Model):
     __tablename__ = "events"

@@ -5,12 +5,36 @@ from models import Event, User
 from datetime import datetime, date
 from whatsapp_service import send_whatsapp
 import re
+from sqlalchemy import or_
+
 events_bp = Blueprint("events", __name__)
 
 TAG_PREFIX_RE = re.compile(r"^\s*__TAG:([A-Za-z0-9_-]+)__\s*(.*)$")
 LEGACY_LABEL_RE = re.compile(r"^\s*__([A-Za-z0-9_-]+)__\s*(.*)$")
 BRACKET_LABEL_RE = re.compile(r"^\s*\[([A-Za-z0-9_-]+)\]\s*(.*)$")
 COLOR_RE = re.compile(r"^\s*\{(#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6}))\}\s*(.*)$")
+
+
+def _is_admin(user: User) -> bool:
+    return (getattr(user, "role", "user") or "user").lower() == "admin"
+
+
+def _get_admin_ids():
+    return [row[0] for row in db.session.query(User.id).filter(User.role == "admin").all()]
+
+
+def _is_admin_locked_cell(date_obj, event_col: int) -> bool:
+    admin_ids = _get_admin_ids()
+    if not admin_ids:
+        return False
+    return (
+        Event.query.filter(
+            Event.user_id.in_(admin_ids),
+            Event.date == date_obj,
+            Event.event_col == event_col,
+        ).first()
+        is not None
+    )
 
 
 def parse_tagged_event_value(raw_value):
@@ -182,9 +206,213 @@ def execute_whatsapp_for_date(target_date):
         "results": results,
     }
 
+
+
+
 @events_bp.route("/month", methods=["GET"])
 @jwt_required()
 def get_month_events():
+    user_id = int(get_jwt_identity())
+
+    year = request.args.get("year", type=int)
+    month = request.args.get("month", type=int)
+
+    if not year or not month:
+        return jsonify({"error": "year and month are required"}), 400
+
+    current_user = User.query.get(user_id)
+    if not current_user:
+        return jsonify({"error": "User not found"}), 404
+
+    base_filters = [
+        db.extract("year", Event.date) == year,
+        db.extract("month", Event.date) == month,
+    ]
+
+    # Admin: own events only
+    if (current_user.role or "user").lower() == "admin":
+        rows = Event.query.filter(
+            Event.user_id == user_id,
+            *base_filters,
+        ).all()
+
+        result = {}
+        for r in rows:
+            date_iso = r.date.isoformat()
+            bucket = result.setdefault(date_iso, {})
+            key = f"Event {r.event_col}"
+            bucket[key] = r.value
+            bucket.setdefault("_descriptions", {})[key] = r.description
+            bucket.setdefault("_styles", {})[key] = "normal"
+            bucket.setdefault("_owners", {})[key] = "admin"
+        return jsonify(result), 200
+
+    # User: own events + admin events
+    admin_ids_q = db.session.query(User.id).filter(User.role == "admin")
+
+    user_rows = Event.query.filter(
+        Event.user_id == user_id,
+        *base_filters,
+    ).all()
+
+    admin_rows = Event.query.filter(
+        Event.user_id.in_(admin_ids_q),
+        *base_filters,
+    ).all()
+
+    result = {}
+
+    def next_free_col(bucket: dict) -> int:
+        used = set()
+        for k in bucket.keys():
+            if k.startswith("Event "):
+                try:
+                    used.add(int(k.replace("Event ", "")))
+                except ValueError:
+                    pass
+        c = 1
+        while c in used:
+            c += 1
+        return c
+
+    # 1) Put admin events first (locked positions)
+    for r in admin_rows:
+        date_iso = r.date.isoformat()
+        bucket = result.setdefault(date_iso, {})
+        key = f"Event {r.event_col}"
+        bucket[key] = r.value
+        bucket.setdefault("_descriptions", {})[key] = r.description
+        bucket.setdefault("_styles", {})[key] = "normal"
+        bucket.setdefault("_owners", {})[key] = "admin"
+
+    # 2) Add user's own events; if same column is occupied by admin event, place in next free column
+    for r in user_rows:
+        date_iso = r.date.isoformat()
+        bucket = result.setdefault(date_iso, {})
+        desired_key = f"Event {r.event_col}"
+
+        if desired_key in bucket:
+            key = f"Event {next_free_col(bucket)}"
+        else:
+            key = desired_key
+
+        bucket[key] = r.value
+        bucket.setdefault("_descriptions", {})[key] = r.description
+        bucket.setdefault("_styles", {})[key] = "italic"
+        bucket.setdefault("_owners", {})[key] = "user"
+
+    return jsonify(result), 200
+
+    user_id = int(get_jwt_identity())
+
+    year = request.args.get("year", type=int)
+    month = request.args.get("month", type=int)
+
+    if not year or not month:
+        return jsonify({"error": "year and month are required"}), 400
+
+    current_user = User.query.get(user_id)
+    if not current_user:
+        return jsonify({"error": "User not found"}), 404
+
+    base_filters = [
+        db.extract("year", Event.date) == year,
+        db.extract("month", Event.date) == month,
+    ]
+
+    if (current_user.role or "user").lower() == "admin":
+        # admin sees own events
+        rows = Event.query.filter(Event.user_id == user_id, *base_filters).all()
+    else:
+        # normal user sees own events + all admin events
+        admin_ids_q = db.session.query(User.id).filter(User.role == "admin")
+        rows = Event.query.filter(
+            *base_filters,
+            or_(
+                Event.user_id == user_id,
+                Event.user_id.in_(admin_ids_q),
+            ),
+        ).all()
+
+    result = {}
+
+    # admin/shared events first
+    for r in rows:
+        if r.user_id == user_id:
+            continue
+        date_iso = r.date.isoformat()
+        bucket = result.setdefault(date_iso, {})
+        key = f"Event {r.event_col}"
+        bucket[key] = r.value
+        bucket.setdefault("_descriptions", {})[key] = r.description
+
+    # user's own events override same cell
+    for r in rows:
+        if r.user_id != user_id:
+            continue
+        date_iso = r.date.isoformat()
+        bucket = result.setdefault(date_iso, {})
+        key = f"Event {r.event_col}"
+        bucket[key] = r.value
+        bucket.setdefault("_descriptions", {})[key] = r.description
+
+    return jsonify(result), 200
+
+    user_id = int(get_jwt_identity())
+
+    year = request.args.get("year", type=int)
+    month = request.args.get("month", type=int)
+
+    if not year or not month:
+        return jsonify({"error": "year and month are required"}), 400
+
+    current_user = User.query.get(user_id)
+    if not current_user:
+        return jsonify({"error": "User not found"}), 404
+
+    base_filters = [
+        db.extract("year", Event.date) == year,
+        db.extract("month", Event.date) == month,
+    ]
+
+    # Admin sees own events only
+    if (current_user.role or "user").lower() == "admin":
+        rows = Event.query.filter(Event.user_id == user_id, *base_filters).all()
+    else:
+        # User sees own events + all admin events
+        admin_ids_q = db.session.query(User.id).filter(User.role == "admin")
+        rows = Event.query.filter(
+            *base_filters,
+            or_(
+                Event.user_id == user_id,
+                Event.user_id.in_(admin_ids_q),
+            ),
+        ).all()
+
+    result = {}
+
+    # Admin events first
+    for r in rows:
+        if r.user_id == user_id:
+            continue
+        date_iso = r.date.isoformat()
+        date_bucket = result.setdefault(date_iso, {})
+        event_key = f"Event {r.event_col}"
+        date_bucket[event_key] = r.value
+        date_bucket.setdefault("_descriptions", {})[event_key] = r.description
+
+    # User's own events override same cell
+    for r in rows:
+        if r.user_id != user_id:
+            continue
+        date_iso = r.date.isoformat()
+        date_bucket = result.setdefault(date_iso, {})
+        event_key = f"Event {r.event_col}"
+        date_bucket[event_key] = r.value
+        date_bucket.setdefault("_descriptions", {})[event_key] = r.description
+
+    return jsonify(result), 200
+
     user_id = get_jwt_identity()
 
     year = request.args.get("year", type=int)
@@ -213,7 +441,7 @@ def get_month_events():
 @events_bp.route("/cell", methods=["POST"])
 @jwt_required()
 def update_cell():
-    user_id = get_jwt_identity()
+    user_id = int(get_jwt_identity())
     data = request.json
 
     if not data:
@@ -226,9 +454,25 @@ def update_cell():
     if date_iso is None or event_col is None or value is None:
         return jsonify({"error": "dateISO, eventCol, value are required"}), 400
 
+    try:
+        date_obj = datetime.strptime(date_iso, "%Y-%m-%d").date()
+        event_col = int(event_col)
+    except (ValueError, TypeError):
+        return jsonify({"error": "Invalid dateISO or eventCol"}), 400
+
+    if event_col <= 0:
+        return jsonify({"error": "eventCol must be > 0"}), 400
+
+    current_user = User.query.get(user_id)
+    if not current_user:
+        return jsonify({"error": "User not found"}), 404
+
+    if not _is_admin(current_user) and _is_admin_locked_cell(date_obj, event_col):
+        return jsonify({"error": "Admin events cannot be edited or deleted by users"}), 403
+
     event = Event.query.filter_by(
         user_id=user_id,
-        date=date_iso,
+        date=date_obj,
         event_col=event_col,
     ).first()
 
@@ -239,7 +483,7 @@ def update_cell():
     else:
         event = Event(
             user_id=user_id,
-            date=date_iso,
+            date=date_obj,
             event_col=event_col,
             value=value,
             description=(data.get("description") or "").strip(),
@@ -273,14 +517,20 @@ def clear_month():
 @events_bp.route("/delete-bulk", methods=["POST"])
 @jwt_required()
 def bulk_delete_events():
-    user_id = get_jwt_identity()
+    user_id = int(get_jwt_identity())
     data = request.get_json() or {}
     items = data.get("items", [])
 
     if not isinstance(items, list):
         return jsonify({"error": "items must be a list"}), 400
 
+    current_user = User.query.get(user_id)
+    if not current_user:
+        return jsonify({"error": "User not found"}), 404
+
+    is_admin_user = _is_admin(current_user)
     deleted = 0
+    blocked_locked = 0
 
     for item in items:
         if not isinstance(item, dict):
@@ -301,6 +551,10 @@ def bulk_delete_events():
         if event_col <= 0:
             continue
 
+        if not is_admin_user and _is_admin_locked_cell(date_obj, event_col):
+            blocked_locked += 1
+            continue
+
         event = Event.query.filter_by(
             user_id=user_id,
             date=date_obj,
@@ -312,13 +566,27 @@ def bulk_delete_events():
             deleted += 1
 
     db.session.commit()
-    return jsonify({"ok": True, "deleted": deleted}), 200
+
+    if blocked_locked > 0:
+        return jsonify({
+            "ok": False,
+            "error": "Admin events cannot be deleted by users",
+            "deleted": deleted,
+            "blocked_locked": blocked_locked,
+        }), 403
+
+    return jsonify({"ok": True, "deleted": deleted, "blocked_locked": 0}), 200
 
 @events_bp.route("/bulk", methods=["POST"])
 @jwt_required()
 def bulk_upsert_events():
-    user_id = get_jwt_identity()
-    data = request.get_json()
+    user_id = int(get_jwt_identity())
+    data = request.get_json() or {}
+
+    current_user = User.query.get(user_id)
+    if not current_user:
+        return jsonify({"error": "User not found"}), 404
+    is_admin_user = _is_admin(current_user)
 
     year = data.get("year")
     month = data.get("month")
@@ -326,6 +594,8 @@ def bulk_upsert_events():
 
     if not year or not month or not isinstance(rows, list):
         return jsonify({"error": "Invalid payload"}), 400
+
+    blocked_locked = 0
 
     for row in rows:
         date_iso = row.get("dateISO")
@@ -365,6 +635,10 @@ def bulk_upsert_events():
             if not value:
                 continue
 
+            if not is_admin_user and _is_admin_locked_cell(date_obj, event_col):
+                blocked_locked += 1
+                continue
+
             existing = Event.query.filter_by(
                 user_id=user_id,
                 date=date_obj,
@@ -384,7 +658,15 @@ def bulk_upsert_events():
                 ))
 
     db.session.commit()
-    return jsonify({"ok": True})
+
+    if blocked_locked > 0:
+        return jsonify({
+            "ok": False,
+            "error": "Admin events cannot be edited by users",
+            "blocked_locked": blocked_locked,
+        }), 403
+
+    return jsonify({"ok": True, "blocked_locked": 0})
 
 
 @events_bp.route("/today-user-events", methods=["GET"])
