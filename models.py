@@ -24,6 +24,10 @@
 from extensions import db
 
 class User(db.Model):
+    __table_args__ = (
+        db.CheckConstraint("role IN ('user', 'admin')", name="ck_users_role_valid"),
+    )
+
     id                = db.Column(db.Integer, primary_key=True)
     username          = db.Column(db.String(80), unique=True, nullable=True)   # now optional
     email             = db.Column(db.String(120), unique=True, nullable=True)
@@ -34,7 +38,7 @@ class User(db.Model):
     display_name      = db.Column(db.String(120), nullable=True)
     avatar_url        = db.Column(db.String(500), nullable=True)
     is_verified       = db.Column(db.Boolean, default=False)
-    role              = db.Column(db.String(20), default="user")   # "user" | "admin"
+    role              = db.Column(db.String(20), nullable=False)   # "user" | "admin"
 
 class Event(db.Model):
     __tablename__ = "events"
